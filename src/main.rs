@@ -15,6 +15,7 @@ use std::result::Result as StdResult;
 use structopt::StructOpt;
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits, SerialPortBuilderExt};
 use tokio_util::codec::{BytesCodec};
+use tokio::time;
 use wildmatch::WildMatch;
 
 mod error;
@@ -29,7 +30,7 @@ struct Opt {
     #[structopt(short, long)]
     port: Option<String>,
 
-    /// Baud rate to use. XXX. 
+    /// Baud rate to use. XXX.
     #[structopt(short, long, default_value = "115200")]
     baud: u32,
 
@@ -44,6 +45,10 @@ struct Opt {
     /// List USB serial devices which are currently connected
     #[structopt(short, long)]
     list: bool,
+
+    /// Wait in a loop until USB serial devices are connected
+    #[structopt(short, long)]
+    wait: bool,
 
     /// Enter character to send (cr, lf, crlf)
     #[structopt(long, default_value = "cr")]
@@ -549,7 +554,7 @@ async fn monitor(port: tokio_serial::SerialStream, opt: &Opt) -> Result<()> {
                     Some(Err(e)) => {
                         println!("Serial Error: {:?}\r", e);
                         // This most likely means that the serial port has been unplugged.
-                        break Ok(());
+                        break Err(e);
                     },
                     None => {
                         println!("maybe_serial returned None\r");
@@ -564,22 +569,28 @@ async fn monitor(port: tokio_serial::SerialStream, opt: &Opt) -> Result<()> {
 // Main entry point to the program.
 #[tokio::main]
 async fn main() -> Result<()> {
-    let result = real_main().await;
-    match result {
-        Ok(()) => std::process::exit(0),
-        Err(ProgramError::NoPortFound) => {
-            writeln!(&mut std::io::stderr(), "No USB serial ports found")?;
-            std::process::exit(1);
-        }
-        Err(err) => {
-            writeln!(&mut std::io::stderr(), "Error: {:?}", err)?;
-            std::process::exit(2);
+    let mut opt = Opt::from_args();
+
+    loop {
+        let result = real_main(&mut opt).await;
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(ProgramError::NoPortFound) => {
+                writeln!(&mut std::io::stderr(), "No USB serial ports found")?;
+                std::process::exit(1);
+            }
+            Err(err) => {
+                writeln!(&mut std::io::stderr(), "Error: {:?}", err)?;
+                if !opt.wait {
+                    std::process::exit(2);
+                }
+            }
         }
     }
 }
 
-async fn real_main() -> Result<()> {
-    let opt = Opt::from_args();
+async fn real_main(opt: &mut Opt) -> Result<()> {
+    // let opt = Opt::from_args();
 
     if opt.verbose {
         println!("{:#?}", opt);
@@ -596,8 +607,27 @@ async fn real_main() -> Result<()> {
     }
 
     // Do the serial port monitoring
-    let port_name = find_port(&opt)?;
-    
+    let mut port_name = String::new();
+
+    if opt.wait {
+        while port_name.is_empty() {
+            let found = find_port(&opt);
+            match found {
+                Ok(str) => {
+                    port_name = str;
+                }
+                Err(_) => {
+                    println!("wait 100 ms for serial port to be ready.");
+                    time::sleep(time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    } else {
+        port_name = find_port(&opt)?;
+    }
+
+    println!("Connecting to serial port: {}", port_name);
+
     let port = tokio_serial::new(port_name.clone(), opt.baud)
     .flow_control(FlowControl::from(opt.flow))
     .parity(Parity::from(opt.parity))
@@ -615,7 +645,7 @@ async fn real_main() -> Result<()> {
         Ok(()) => (),
         Err(err) => {
             writeln!(&mut std::io::stderr(), "Error: {:?}", err)?;
-            std::process::exit(2);
+            return Err(err);
         }
     }
     disable_raw_mode()?;
